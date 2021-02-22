@@ -1,0 +1,189 @@
+---
+title: "Nikola - Random Forest - Agronomic Trial - Soybean Yield"
+author: "Nikola Arsenijevic"
+date: "2/21/2021"
+output: pdf_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(
+  echo = TRUE,
+  warning = FALSE,
+  message = FALSE)
+```
+
+
+```{r packages}
+library(parsnip)
+library(tidymodels)
+library(vctrs)
+library(hardhat)
+library(tidyverse)
+library(ggplot2)
+library(RColorBrewer)
+library(tidyr)
+library(doParallel)
+library(ranger)
+library(vip)
+library(RCurl)
+```
+
+
+
+```{r data loading}
+data <- read_csv("rfyield.csv")
+
+data$year=as.factor(data$year)
+data$pt=as.factor(data$pt)
+data$rs=as.factor(data$rs)
+data$herb=as.factor(data$herb)
+data$tillage=as.factor(data$tillage)
+
+data
+```
+
+```{r data split}
+set.seed(123)
+s1_split <- initial_split(data, strata = yield_bu)
+s1_train <- training(s1_split)
+s1_test <- testing(s1_split)
+```
+
+```{r model and hyperparameters tuning}
+
+set.seed(123)
+# Recipe
+s1_rec <- recipe(yield_bu ~ ., data=s1_train)
+
+# Model
+tune_spec <- rand_forest(mtry=tune(), trees=1000, min_n=tune()) %>% 
+  set_mode("regression") %>%
+  set_engine("ranger") 
+
+# Workflow
+tune_wf <- workflow() %>%
+  add_recipe(s1_rec) %>% 
+  add_model(tune_spec) 
+
+```
+
+
+```{r dataset training}
+set.seed(123)
+s1_folds <- vfold_cv(s1_train)
+
+doParallel::registerDoParallel()  # allows for faster tuning, good for large datasets
+
+tune_res <- tune_grid(tune_wf, resamples=s1_folds, grid=20)  # larger the grid value, longer it takes to code to run
+```
+
+```{r}
+set.seed(123)
+tune_res %>%
+  select_best("rmse") # selects for optimal mtry and min_n values
+```
+
+
+```{r}
+set.seed(123)
+tune_res %>%
+  collect_metrics() %>% # views the results for the entire grid
+  filter(.metric =="rmse") %>% 
+  pivot_longer(min_n:mtry, values_to="value", names_to="parameter") %>% 
+  ggplot(aes(value, mean, color=parameter)) +
+  geom_point(show.legend=FALSE) +
+  facet_wrap(~ parameter)
+```
+
+```{r}
+set.seed(123)
+rf_grid <- grid_regular(mtry(range=c(1,5)), min_n(range=c(25,35)), levels=5)  
+
+set.seed(123)
+regular_res <- tune_grid(tune_wf, resamples=s1_folds, grid=rf_grid) 
+
+regular_res %>%
+  select_best("rmse")
+```
+
+```{r}
+regular_res %>%
+  collect_metrics() %>%
+  filter(.metric =="rmse") %>% 
+  mutate(min_n = factor(min_n)) %>% 
+  ggplot(aes(mtry, mean, color = min_n)) +
+  geom_line(alpha=0.5, size=1.5) +
+  geom_point()
+```
+
+
+
+
+```{r finalizing the model}
+set.seed(123)
+
+best_rmse <- select_best(regular_res, "rmse")
+final_rf <- finalize_model(tune_spec, best_rmse)
+
+final_rf %>%
+  set_engine("ranger", importance="impurity") %>% 
+  fit(yield_bu ~ ., data=s1_train) %>%
+  #vi() %>% 
+  #Dot plot
+  vip(geom="point", horizontal=TRUE, aesthetics=list(color="black", size=3)) + 
+  theme_light() + 
+  theme(plot.title = element_text(hjust=0.5, size=35, face="bold"),
+                     axis.title.x = element_text(size=20, color="black"), 
+                     legend.title = element_blank(),
+                     axis.text.x = element_text(size=15, color="black"),
+                     axis.text.y = element_text(size=15, hjust=0, color="black"),
+                     strip.text.x = element_text(size=25, color="black", face="bold"),
+                     strip.text = element_text(size=13), 
+                     panel.background =element_rect(fill="white"),
+                     panel.grid.major=element_line(color="white"),
+                     panel.grid.minor=element_line(color="white")) +
+  labs(y="Variable Importance")
+```
+
+
+
+```{r}
+final_rf %>%
+  set_engine("ranger", importance="impurity") %>%
+  fit(yield_bu ~ ., data=s1_train) %>% 
+  #Bar plot
+  vip(geom="col", horizontal=TRUE) +
+  theme_light() + 
+  theme(plot.title = element_text(hjust=0.5, size=35, face="bold"),
+                     axis.title.x = element_text(size=20, color="black"), 
+                     legend.title = element_blank(),
+                     axis.text.x = element_text(size=15, color="black"),
+                     axis.text.y = element_text(size=15, hjust=0, color="black"),
+                     strip.text.x = element_text(size=25, color="black", face="bold"),
+                     strip.text = element_text(size=13), 
+                     panel.background =element_rect(fill="white"),
+                     panel.grid.major=element_line(color="white"),
+                     panel.grid.minor=element_line(color="white")) +
+  labs(y="Variable Importance")
+```
+
+
+```{r}
+final_wf <- workflow() %>% # testing the model
+  add_recipe(s1_rec) %>% 
+  add_model(final_rf) 
+
+final_res <- final_wf %>%
+  last_fit(s1_split)
+```
+
+```{r}
+final_res %>%
+  collect_metrics()
+```
+
+```{r}
+final_res %>%
+  collect_predictions() %>% 
+  bind_cols(s1_test)
+```
